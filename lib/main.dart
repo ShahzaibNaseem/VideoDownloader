@@ -26,6 +26,7 @@ class MyApp extends StatelessWidget {
         GetPage(
           name: '/',
           page: () => const HomeScreen(),
+          binding: AppBinding(),
         ),
         GetPage(
           name: '/preview',
