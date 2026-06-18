@@ -8,7 +8,7 @@ class AppBinding extends Bindings {
     // Inject DownloadService (lazy loaded, singleton)
     Get.lazyPut<DownloadService>(() => DownloadService(), fenix: true);
     
-    // Inject HomeViewModel (lazy loaded)
-    Get.lazyPut<HomeViewModel>(() => HomeViewModel(downloadService: Get.find<DownloadService>()));
+    // Inject HomeViewModel (lazy loaded, fenix: true so it survives Get.offAllNamed)
+    Get.lazyPut<HomeViewModel>(() => HomeViewModel(downloadService: Get.find<DownloadService>()), fenix: true);
   }
 }

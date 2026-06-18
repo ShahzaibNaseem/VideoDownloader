@@ -69,27 +69,36 @@ class DownloadInputField extends GetView<HomeViewModel> {
                       ),
                     ),
                   ),
-                  // Paste / Clear Action Button
+                  // Paste / Clear Action Buttons
                   Padding(
-                    padding: const EdgeInsets.only(right: 12.0),
-                    child: isUrlEmpty
-                        ? Material(
-                            color: AppColors.surfaceContainer,
-                            shape: const CircleBorder(),
-                            child: InkWell(
-                              onTap: controller.pasteFromClipboard,
-                              customBorder: const CircleBorder(),
-                              child: const Padding(
-                                padding: EdgeInsets.all(10.0),
-                                child: Icon(
-                                  Icons.content_paste_rounded,
-                                  color: AppColors.textPrimary,
-                                  size: 20,
-                                ),
+                    padding: const EdgeInsets.only(right: 8.0),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Paste button — always visible so user can replace text at any time
+                        Material(
+                          color: isUrlEmpty
+                              ? AppColors.surfaceContainer
+                              : Colors.transparent,
+                          shape: const CircleBorder(),
+                          child: InkWell(
+                            onTap: controller.pasteFromClipboard,
+                            customBorder: const CircleBorder(),
+                            child: Padding(
+                              padding: const EdgeInsets.all(10.0),
+                              child: Icon(
+                                Icons.content_paste_rounded,
+                                color: isUrlEmpty
+                                    ? AppColors.textPrimary
+                                    : AppColors.primary,
+                                size: 20,
                               ),
                             ),
-                          )
-                        : Material(
+                          ),
+                        ),
+                        // Clear (X) button — only shown when field has text
+                        if (!isUrlEmpty)
+                          Material(
                             color: Colors.transparent,
                             shape: const CircleBorder(),
                             child: InkWell(
@@ -105,6 +114,8 @@ class DownloadInputField extends GetView<HomeViewModel> {
                               ),
                             ),
                           ),
+                      ],
+                    ),
                   ),
                 ],
               ),

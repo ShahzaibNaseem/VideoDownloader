@@ -4,23 +4,32 @@ import 'package:dio/dio.dart';
 import 'package:gal/gal.dart';
 import 'package:get/get.dart' hide Response;
 import 'package:path_provider/path_provider.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import '../models/download_item.dart';
 
 class DownloadService extends GetxService {
   late final Dio _dio;
+  late final YoutubeExplode _yt;
 
   @override
   void onInit() {
     super.onInit();
     _dio = Dio(BaseOptions(
       connectTimeout: const Duration(seconds: 20),
-      receiveTimeout: const Duration(minutes: 5),
+      receiveTimeout: const Duration(minutes: 10),
       headers: {
         'User-Agent':
             'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 '
             '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
       },
     ));
+    _yt = YoutubeExplode();
+  }
+
+  @override
+  void onClose() {
+    _yt.close();
+    super.onClose();
   }
 
   // ─── URL Validation ─────────────────────────────────────────────────────────
@@ -34,10 +43,13 @@ class DownloadService extends GetxService {
     if (host.contains('instagram.com') || host.contains('instagr.am')) {
       return MediaPlatform.instagram;
     }
+    if (host.contains('youtube.com') || host.contains('youtu.be') || host.contains('yt.be')) {
+      return MediaPlatform.youtube;
+    }
     return MediaPlatform.unknown;
   }
 
-  /// Returns true if the URL is a supported TikTok or Instagram link.
+  /// Returns true if the URL is a supported TikTok, Instagram, or YouTube link.
   bool isValidUrl(String url) {
     if (url.isEmpty) return false;
     return detectPlatform(url) != MediaPlatform.unknown;
@@ -53,8 +65,10 @@ class DownloadService extends GetxService {
         return _fetchTikTokMetadata(url);
       case MediaPlatform.instagram:
         return _fetchInstagramMetadata(url);
+      case MediaPlatform.youtube:
+        return _fetchYouTubeMetadata(url);
       case MediaPlatform.unknown:
-        throw Exception('Unsupported URL. Please enter a TikTok or Instagram link.');
+        throw Exception('Unsupported URL. Please enter a TikTok, Instagram, or YouTube link.');
     }
   }
 
@@ -86,17 +100,21 @@ class DownloadService extends GetxService {
       final String thumbnail = data['cover'] as String? ?? data['origin_cover'] as String? ?? '';
       final String authorName = author['nickname'] as String? ?? author['unique_id'] as String? ?? '';
 
-      // Collect quality options — only include keys that have valid URLs
+      // Duration from API
+      final int durationSeconds = (data['duration'] as num?)?.toInt() ?? 0;
+
+      // Collect quality options — prefer HD first, then no-watermark
       final Map<String, String> qualityOptions = {};
-      final String? noWatermark = data['play'] as String?;
       final String? hdPlay = data['hdplay'] as String?;
+      final String? noWatermark = data['play'] as String?;
       final String? wmPlay = data['wmplay'] as String?;
 
-      if (noWatermark != null && noWatermark.isNotEmpty) {
-        qualityOptions['No Watermark'] = noWatermark;
+      // HD is highest quality — add first so it becomes default
+      if (hdPlay != null && hdPlay.isNotEmpty) {
+        qualityOptions['HD (No Watermark)'] = hdPlay;
       }
-      if (hdPlay != null && hdPlay.isNotEmpty && hdPlay != noWatermark) {
-        qualityOptions['HD'] = hdPlay;
+      if (noWatermark != null && noWatermark.isNotEmpty && noWatermark != hdPlay) {
+        qualityOptions['No Watermark'] = noWatermark;
       }
       if (wmPlay != null && wmPlay.isNotEmpty) {
         qualityOptions['Watermarked'] = wmPlay;
@@ -121,236 +139,478 @@ class DownloadService extends GetxService {
         authorName: authorName,
         platform: MediaPlatform.tiktok,
         qualityOptions: qualityOptions,
+        durationSeconds: durationSeconds,
       );
     } on DioException catch (e) {
       throw Exception(_mapDioError(e, 'TikTok'));
     }
   }
 
-  // ─── Instagram via SaveInsta Scraper ───────────────────────────────────────
+  // ─── Instagram — primary: SnapSave, fallback: SaveInsta ─────────────────────
 
   Future<DownloadItem> _fetchInstagramMetadata(String url) async {
-    try {
-      var targetUrl = _cleanInstagramUrl(url);
-      if (url.contains('/share/') || url.contains('instagr.am')) {
-        final redirectResponse = await _dio.get(
+    // Resolve share/redirect links first
+    String targetUrl = _cleanInstagramUrl(url);
+    if (url.contains('/share/') || url.contains('instagr.am')) {
+      try {
+        final r = await _dio.get(
           url,
           options: Options(
             followRedirects: true,
             maxRedirects: 5,
-            validateStatus: (status) => status != null && status < 500,
+            validateStatus: (s) => s != null && s < 500,
           ),
         );
-        targetUrl = _cleanInstagramUrl(redirectResponse.realUri.toString());
+        targetUrl = _cleanInstagramUrl(r.realUri.toString());
+      } catch (_) {}
+    }
+
+    // Try primary backend first, then fall back
+    try {
+      return await _fetchInstagramViaSnapSave(targetUrl, url);
+    } catch (e1) {
+      try {
+        return await _fetchInstagramViaSaveInsta(targetUrl, url);
+      } catch (e2) {
+        throw Exception('Could not fetch Instagram media. Please check the URL and try again.');
       }
+    }
+  }
 
-      // Step 1: Fetch highlights HTML from saveinsta.to to get tokens
-      final response1 = await _dio.get(
-        'https://saveinsta.to/en/highlights',
-        options: Options(
-          headers: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.google.com/',
-          },
-        ),
-      );
+  // ── Primary: SnapSave ──────────────────────────────────────────────────────
 
-      final html = response1.data.toString();
-      final scriptRegExp = RegExp(
-          r'<script[^>]*>var\s+k_url_search="[^"]+"(.*?)<\/script>',
-          dotAll: true);
-      final match = scriptRegExp.firstMatch(html);
-      if (match == null) {
-        throw Exception('Failed to initialize download tokens (JS block not found).');
-      }
-
-      final scriptBlock = match.group(1) ?? '';
-      
-      String? extractJsVar(String name, String source) {
-        final regExp = RegExp('$name\\s*=\\s*"([^"]+)"');
-        final m = regExp.firstMatch(source);
-        return m?.group(1);
-      }
-
-      final kExp = extractJsVar('k_exp', scriptBlock);
-      final kToken = extractJsVar('k_token', scriptBlock);
-
-      if (kExp == null || kToken == null) {
-        throw Exception('Failed to parse download security keys.');
-      }
-
-      // Step 2: Delay
-      await Future.delayed(const Duration(milliseconds: 1200));
-
-      // Step 3: Get CF token via userverify
-      final response2 = await _dio.post(
-        'https://saveinsta.to/api/userverify',
-        data: {
-          'url': targetUrl,
+  Future<DownloadItem> _fetchInstagramViaSnapSave(String targetUrl, String originalUrl) async {
+    // Step 1: fetch the SnapSave page to grab the CSRF token
+    final pageResp = await _dio.get(
+      'https://snapsave.app/',
+      options: Options(
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
         },
-        options: Options(
-          contentType: Headers.formUrlEncodedContentType,
-          headers: {
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://saveinsta.to',
-            'Referer': 'https://saveinsta.to/en/video',
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-        ),
-      );
+        receiveTimeout: const Duration(seconds: 20),
+      ),
+    );
 
-      final cftokenData = response2.data;
-      if (cftokenData == null || cftokenData['token'] == null) {
-        throw Exception('Failed to obtain verification token from server.');
-      }
+    final pageHtml = pageResp.data.toString();
 
-      final cftoken = cftokenData['token'];
+    // Extract _token (Laravel CSRF)
+    final tokenMatch = RegExp(r'name="_token"\s+value="([^"]+)"').firstMatch(pageHtml);
+    final token = tokenMatch?.group(1) ?? '';
 
-      // Step 4: Delay
-      await Future.delayed(const Duration(milliseconds: 1200));
-
-      // Step 5: Request final content from ajaxSearch
-      final response3 = await _dio.post(
-        'https://saveinsta.to/api/ajaxSearch',
-        data: {
-          'k_exp': kExp,
-          'k_token': kToken,
-          'q': targetUrl,
-          't': 'media',
-          'lang': 'en',
-          'v': 'v2',
-          'cftoken': cftoken,
+    // Step 2: Submit the Instagram URL to SnapSave
+    final resp = await _dio.post(
+      'https://snapsave.app/action.php',
+      data: 'url=${Uri.encodeComponent(targetUrl)}&lang=en&v=v2',
+      options: Options(
+        contentType: Headers.formUrlEncodedContentType,
+        headers: {
+          'Accept': '*/*',
+          'Origin': 'https://snapsave.app',
+          'Referer': 'https://snapsave.app/',
+          if (token.isNotEmpty) 'X-CSRF-TOKEN': token,
         },
-        options: Options(
-          contentType: Headers.formUrlEncodedContentType,
-          headers: {
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://saveinsta.to',
-            'Referer': 'https://saveinsta.to/en/highlights',
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-        ),
-      );
+        receiveTimeout: const Duration(seconds: 30),
+      ),
+    );
 
-      final finalData = response3.data;
-      if (finalData == null || finalData['status'] != 'ok') {
-        final message = finalData?['mess'] ?? 'Unknown download error.';
-        throw Exception(message.toString().replaceAll(RegExp(r'<[^>]*>'), ''));
-      }
+    // SnapSave returns JSON: {"status": "ok", "data": "<html>..."}
+    final respData = resp.data;
+    String htmlContent = '';
+    if (respData is Map && respData['data'] != null) {
+      htmlContent = respData['data'].toString();
+    } else if (respData is String) {
+      htmlContent = respData;
+    }
 
-      final String finalHtml = finalData['data'] ?? '';
-      if (finalHtml.isEmpty) {
-        throw Exception('No media links returned by downloader backend.');
-      }
+    if (htmlContent.isEmpty) throw Exception('Empty response from SnapSave.');
 
-      // Step 6: Parse final HTML
-      final liRegex = RegExp(r'<li[^>]*>(.*?)</li>', dotAll: true);
-      final liMatches = liRegex.allMatches(finalHtml);
-      final extracted = <Map<String, dynamic>>[];
+    // Step 3: Parse download links from the returned HTML fragment
+    return _parseSnapSaveHtml(htmlContent, originalUrl);
+  }
 
-      for (final liMatch in liMatches) {
-        final liHtml = liMatch.group(1) ?? '';
-        
-        // 1. Determine type (image or video)
-        bool isVideo = false;
-        if (liHtml.contains('icon-dlvideo') || liHtml.contains('video="') || liHtml.contains('Download Video')) {
-          isVideo = true;
+  DownloadItem _parseSnapSaveHtml(String html, String originalUrl) {
+    // SnapSave returns an HTML table with download rows.
+    // Each row has: thumbnail, type label (Photo/Video), download link.
+    final rows = <Map<String, dynamic>>[];
+
+    // Extract all <tr> blocks
+    final trRegex = RegExp(r'<tr[^>]*>(.*?)</tr>', dotAll: true);
+    for (final tr in trRegex.allMatches(html)) {
+      final trHtml = tr.group(1) ?? '';
+
+      // Determine if this row is a video by looking for 'video' keyword or mp4
+      final bool isVideo =
+          trHtml.toLowerCase().contains('video') ||
+          trHtml.toLowerCase().contains('.mp4') ||
+          trHtml.toLowerCase().contains('mp4') ||
+          trHtml.contains('icon-video');
+
+      // Extract download href — prefer direct CDN links
+      String? downloadUrl;
+      final anchors = RegExp(r'href="(https?://[^"]+)"', caseSensitive: false)
+          .allMatches(trHtml)
+          .map((m) => m.group(1)!)
+          .toList();
+
+      // Prefer CDN video URL (cdninstagram, fbcdn, etc.)
+      for (final href in anchors) {
+        if (href.contains('cdninstagram') || href.contains('fbcdn') || href.contains('.mp4')) {
+          downloadUrl = href;
+          break;
         }
-        
-        // 2. Extract download URL
-        String? downloadUrl;
-        final aRegex = RegExp(r'<a[^>]+href="([^"]+)"', caseSensitive: false);
-        final aMatches = aRegex.allMatches(liHtml);
-        for (final aMatch in aMatches) {
-          final href = aMatch.group(1);
-          if (href != null && href.startsWith('http')) {
-            if (href.contains('token=') || href.contains('download')) {
-              downloadUrl = href;
-              break;
-            }
+      }
+      // Fall back to first link
+      if (downloadUrl == null && anchors.isNotEmpty) {
+        downloadUrl = anchors.first;
+      }
+
+      // Extract thumbnail from img src
+      String? thumb;
+      final imgMatch = RegExp(r'<img[^>]+src="([^"]+)"', caseSensitive: false).firstMatch(trHtml);
+      if (imgMatch != null) thumb = imgMatch.group(1);
+
+      if (downloadUrl != null && downloadUrl.startsWith('http')) {
+        rows.add({'url': downloadUrl, 'isVideo': isVideo, 'thumbnail': thumb});
+      }
+    }
+
+    // If no rows found via <tr>, try flat <a> link extraction (some response formats)
+    if (rows.isEmpty) {
+      final allLinks = RegExp(r'href="(https?://[^"]+)"', caseSensitive: false)
+          .allMatches(html)
+          .map((m) => m.group(1)!)
+          .where((u) => u.contains('cdninstagram') || u.contains('fbcdn') || u.contains('snapsave'))
+          .toList();
+
+      for (final link in allLinks) {
+        rows.add({
+          'url': link,
+          'isVideo': link.contains('.mp4') || link.contains('video'),
+          'thumbnail': null,
+        });
+      }
+    }
+
+    if (rows.isEmpty) throw Exception('No media found in SnapSave response.');
+
+    // Separate videos from images; prefer video rows
+    final videoRows = rows.where((r) => r['isVideo'] == true).toList();
+    final imageRows = rows.where((r) => r['isVideo'] != true).toList();
+
+    final bool isCarousel = rows.length > 1 && imageRows.length > 1;
+    final bool hasVideo = videoRows.isNotEmpty;
+
+    String thumbnail = '';
+    for (final r in rows) {
+      if (r['thumbnail'] != null) { thumbnail = r['thumbnail'] as String; break; }
+    }
+
+    final Map<String, String> qualityOptions = {};
+    if (isCarousel) {
+      // Carousel: each item is separate
+      for (int i = 0; i < rows.length; i++) {
+        qualityOptions['Item ${i + 1}'] = rows[i]['url'] as String;
+      }
+    } else if (hasVideo) {
+      // Video reel — may have multiple quality variants
+      for (int i = 0; i < videoRows.length; i++) {
+        final label = videoRows.length == 1 ? 'Download' : 'Quality ${i + 1}';
+        qualityOptions[label] = videoRows[i]['url'] as String;
+      }
+    } else {
+      qualityOptions['Download'] = rows.first['url'] as String;
+    }
+
+    final DownloadType dtype = isCarousel
+        ? DownloadType.carousel
+        : (hasVideo ? DownloadType.video : DownloadType.image);
+
+    return DownloadItem(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      url: originalUrl,
+      title: isCarousel
+          ? 'Instagram Carousel (${rows.length} items)'
+          : (hasVideo ? 'Instagram Reel' : 'Instagram Photo'),
+      thumbnailUrl: thumbnail,
+      progress: 0.0,
+      status: DownloadStatus.idle,
+      fileSize: 'Checking...',
+      type: dtype,
+      timestamp: DateTime.now(),
+      authorName: '',
+      platform: MediaPlatform.instagram,
+      qualityOptions: qualityOptions,
+      durationSeconds: 0,
+    );
+  }
+
+  // ── Fallback: SaveInsta ────────────────────────────────────────────────────
+
+  Future<DownloadItem> _fetchInstagramViaSaveInsta(String targetUrl, String originalUrl) async {
+    // Step 1: Fetch highlights HTML from saveinsta.to to get tokens
+    final response1 = await _dio.get(
+      'https://saveinsta.to/en/highlights',
+      options: Options(
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://www.google.com/',
+        },
+      ),
+    );
+
+    final html = response1.data.toString();
+    final scriptRegExp = RegExp(
+        r'<script[^>]*>var\s+k_url_search="[^"]+"(.*?)<\/script>',
+        dotAll: true);
+    final match = scriptRegExp.firstMatch(html);
+    if (match == null) throw Exception('SaveInsta: JS block not found.');
+
+    final scriptBlock = match.group(1) ?? '';
+    String? extractJsVar(String name, String source) {
+      final m = RegExp('$name\\s*=\\s*"([^"]+)"').firstMatch(source);
+      return m?.group(1);
+    }
+    final kExp = extractJsVar('k_exp', scriptBlock);
+    final kToken = extractJsVar('k_token', scriptBlock);
+    if (kExp == null || kToken == null) throw Exception('SaveInsta: security keys not found.');
+
+    await Future.delayed(const Duration(milliseconds: 1200));
+
+    final response2 = await _dio.post(
+      'https://saveinsta.to/api/userverify',
+      data: {'url': targetUrl},
+      options: Options(
+        contentType: Headers.formUrlEncodedContentType,
+        headers: {
+          'Accept': '*/*',
+          'Origin': 'https://saveinsta.to',
+          'Referer': 'https://saveinsta.to/en/video',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      ),
+    );
+    final cftoken = response2.data?['token'];
+    if (cftoken == null) throw Exception('SaveInsta: verification token missing.');
+
+    await Future.delayed(const Duration(milliseconds: 1200));
+
+    final response3 = await _dio.post(
+      'https://saveinsta.to/api/ajaxSearch',
+      data: {
+        'k_exp': kExp, 'k_token': kToken, 'q': targetUrl,
+        't': 'media', 'lang': 'en', 'v': 'v2', 'cftoken': cftoken,
+      },
+      options: Options(
+        contentType: Headers.formUrlEncodedContentType,
+        headers: {
+          'Accept': '*/*',
+          'Origin': 'https://saveinsta.to',
+          'Referer': 'https://saveinsta.to/en/highlights',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      ),
+    );
+
+    final finalData = response3.data;
+    if (finalData == null || finalData['status'] != 'ok') {
+      final msg = finalData?['mess'] ?? 'Unknown error.';
+      throw Exception(msg.toString().replaceAll(RegExp(r'<[^>]*>'), ''));
+    }
+
+    final String finalHtml = finalData['data'] ?? '';
+    if (finalHtml.isEmpty) throw Exception('SaveInsta: no media links returned.');
+
+    // Parse HTML — look for any video or image download links
+    final liRegex = RegExp(r'<li[^>]*>(.*?)</li>', dotAll: true);
+    final extracted = <Map<String, dynamic>>[];
+
+    for (final liMatch in liRegex.allMatches(finalHtml)) {
+      final liHtml = liMatch.group(1) ?? '';
+
+      // Video detection — check multiple indicators
+      final bool isVideo =
+          liHtml.contains('icon-dlvideo') ||
+          liHtml.contains('video=') ||
+          liHtml.contains('Download Video') ||
+          liHtml.toLowerCase().contains('.mp4') ||
+          liHtml.toLowerCase().contains('mp4') ||
+          liHtml.toLowerCase().contains('video');
+
+      String? downloadUrl;
+      final aRegex = RegExp(r'<a[^>]+href="([^"]+)"', caseSensitive: false);
+      for (final aMatch in aRegex.allMatches(liHtml)) {
+        final href = aMatch.group(1);
+        if (href != null && href.startsWith('http')) {
+          if (href.contains('token=') || href.contains('download') ||
+              href.contains('cdninstagram') || href.contains('fbcdn')) {
+            downloadUrl = href;
+            break;
           }
         }
-        
-        if (downloadUrl == null) {
-          for (final aMatch in aMatches) {
-            final href = aMatch.group(1);
-            if (href != null && href.startsWith('http')) {
-              downloadUrl = href;
-              break;
-            }
-          }
-        }
-        
-        // 3. Extract thumbnail
-        String? thumbUrl;
-        final imgRegex = RegExp(r'<img[^>]+(?:src|data-src)="([^"]+)"', caseSensitive: false);
-        final imgMatch = imgRegex.firstMatch(liHtml);
-        if (imgMatch != null) {
-          thumbUrl = imgMatch.group(1);
-          if (thumbUrl != null && (thumbUrl.contains('loader.gif') || thumbUrl.contains('placeholder'))) {
-            final dataSrcRegex = RegExp(r'data-src="([^"]+)"', caseSensitive: false);
-            final dataSrcMatch = dataSrcRegex.firstMatch(liHtml);
-            if (dataSrcMatch != null) {
-              thumbUrl = dataSrcMatch.group(1);
-            }
-          }
-        }
-        
-        if (downloadUrl != null) {
-          extracted.add({
-            'url': downloadUrl,
-            'thumbnail': thumbUrl,
-            'isVideo': isVideo,
-          });
-        }
       }
+      downloadUrl ??= aRegex.allMatches(liHtml)
+          .map((m) => m.group(1))
+          .firstWhere((h) => h != null && h.startsWith('http'), orElse: () => null);
 
-      if (extracted.isEmpty) {
-        throw Exception('No downloadable media found at this Instagram URL.');
+      String? thumbUrl;
+      final imgMatch = RegExp(r'<img[^>]+(?:src|data-src)="([^"]+)"', caseSensitive: false)
+          .firstMatch(liHtml);
+      if (imgMatch != null) thumbUrl = imgMatch.group(1);
+
+      if (downloadUrl != null) {
+        extracted.add({'url': downloadUrl, 'thumbnail': thumbUrl, 'isVideo': isVideo});
       }
+    }
 
-      final bool isCarousel = extracted.length > 1;
-      final bool firstIsVideo = extracted.first['isVideo'] == true;
-      final DownloadType downloadType = isCarousel
-          ? DownloadType.carousel
-          : (firstIsVideo ? DownloadType.video : DownloadType.image);
+    if (extracted.isEmpty) throw Exception('SaveInsta: no downloadable media found.');
 
-      final String thumbnail = extracted.first['thumbnail'] as String? ?? '';
+    final bool isCarousel = extracted.length > 1;
+    final videoRows = extracted.where((e) => e['isVideo'] == true).toList();
+    final bool hasVideo = videoRows.isNotEmpty;
 
-      final Map<String, String> qualityOptions = {};
+    final String thumbnail = extracted.first['thumbnail'] as String? ?? '';
+    final Map<String, String> qualityOptions = {};
+
+    if (isCarousel) {
       for (int i = 0; i < extracted.length; i++) {
-        final item = extracted[i];
-        final String itemUrl = item['url'] as String;
-        if (isCarousel) {
-          qualityOptions['Item ${i + 1}'] = itemUrl;
-        } else {
-          qualityOptions['Download'] = itemUrl;
+        qualityOptions['Item ${i + 1}'] = extracted[i]['url'] as String;
+      }
+    } else if (hasVideo) {
+      qualityOptions['Download'] = videoRows.first['url'] as String;
+    } else {
+      qualityOptions['Download'] = extracted.first['url'] as String;
+    }
+
+    final DownloadType dtype = isCarousel
+        ? DownloadType.carousel
+        : (hasVideo ? DownloadType.video : DownloadType.image);
+
+    return DownloadItem(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      url: originalUrl,
+      title: isCarousel
+          ? 'Instagram Carousel (${extracted.length} items)'
+          : (hasVideo ? 'Instagram Reel' : 'Instagram Photo'),
+      thumbnailUrl: thumbnail,
+      progress: 0.0,
+      status: DownloadStatus.idle,
+      fileSize: 'Checking...',
+      type: dtype,
+      timestamp: DateTime.now(),
+      authorName: '',
+      platform: MediaPlatform.instagram,
+      qualityOptions: qualityOptions,
+      durationSeconds: 0,
+    );
+  }
+
+  // ─── YouTube via youtube_explode_dart ────────────────────────────────────────
+
+
+  Future<DownloadItem> _fetchYouTubeMetadata(String url) async {
+    try {
+      // Pre-process the URL to extract a clean video ID — handles Shorts, youtu.be,
+      // regular watch URLs, and strips tracking params like ?si= that confuse the library.
+      final String rawId = _extractYouTubeVideoId(url);
+      if (rawId.isEmpty) {
+        throw Exception('Could not extract a YouTube video ID from this URL. Please copy the URL directly from YouTube.');
+      }
+
+      final videoId = VideoId(rawId);
+      final video = await _yt.videos.get(videoId);
+      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
+
+      // Build quality options from muxed streams (video+audio combined)
+      // For best quality: use muxed streams up to 1080p, prefer highest available
+      final Map<String, String> qualityOptions = {};
+
+      // Sort muxed streams by bitrate descending (higher = better quality)
+      final muxedStreams = manifest.muxed.toList()
+        ..sort((a, b) => b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
+
+      // Label priority mapping
+      final Map<String, String> addedResolutions = {};
+      for (final stream in muxedStreams) {
+        final label = _ytQualityLabel(stream.videoQuality);
+        if (!addedResolutions.containsKey(label)) {
+          // Store as URL directly
+          qualityOptions[label] = stream.url.toString();
+          addedResolutions[label] = stream.url.toString();
         }
       }
+
+      // If no muxed streams, fall back to highest-quality video-only + best audio
+      // (We still offer a combined download path)
+      if (qualityOptions.isEmpty) {
+        final videoStreams = manifest.videoOnly.toList()
+          ..sort((a, b) => b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
+        for (final stream in videoStreams.take(3)) {
+          final label = _ytQualityLabel(stream.videoQuality);
+          if (!qualityOptions.containsKey(label)) {
+            qualityOptions[label] = stream.url.toString();
+          }
+        }
+      }
+
+      if (qualityOptions.isEmpty) {
+        throw Exception('No downloadable streams found for this YouTube video.');
+      }
+
+      // Duration
+      final int durationSec = video.duration?.inSeconds ?? 0;
+
+      // File size estimate from highest quality stream
+      final String fileSize = muxedStreams.isNotEmpty
+          ? '${(muxedStreams.first.size.totalMegaBytes).toStringAsFixed(1)} MB'
+          : 'Unknown';
+
+      // Thumbnail: use maxres thumbnail
+      final String thumbnail = 'https://img.youtube.com/vi/${video.id.value}/maxresdefault.jpg';
 
       return DownloadItem(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         url: url,
-        title: isCarousel
-            ? 'Instagram Carousel (${extracted.length} items)'
-            : (firstIsVideo ? 'Instagram Reel' : 'Instagram Photo'),
+        title: video.title,
         thumbnailUrl: thumbnail,
         progress: 0.0,
         status: DownloadStatus.idle,
-        fileSize: 'Checking...',
-        type: downloadType,
+        fileSize: fileSize,
+        type: DownloadType.video,
         timestamp: DateTime.now(),
-        authorName: '',
-        platform: MediaPlatform.instagram,
+        authorName: video.author,
+        platform: MediaPlatform.youtube,
         qualityOptions: qualityOptions,
+        durationSeconds: durationSec,
       );
-    } on DioException catch (e) {
-      throw Exception(_mapDioError(e, 'Instagram'));
+    } on VideoUnavailableException catch (_) {
+      throw Exception('This YouTube video is unavailable or private.');
     } catch (e) {
-      throw Exception(e.toString().replaceAll('Exception:', '').trim());
+      final msg = e.toString().replaceAll('Exception:', '').trim();
+      throw Exception('YouTube: $msg');
+    }
+  }
+
+  /// Maps VideoQuality to a human-readable label
+  String _ytQualityLabel(VideoQuality quality) {
+    switch (quality) {
+      case VideoQuality.high2160:
+        return '4K (2160p)';
+      case VideoQuality.high1440:
+        return 'QHD (1440p)';
+      case VideoQuality.high1080:
+        return 'Full HD (1080p)';
+      case VideoQuality.high720:
+        return 'HD (720p)';
+      case VideoQuality.medium480:
+        return 'SD (480p)';
+      case VideoQuality.medium360:
+        return 'Low (360p)';
+      case VideoQuality.low240:
+        return 'Lowest (240p)';
+      default:
+        return quality.name;
     }
   }
 
@@ -373,21 +633,61 @@ class DownloadService extends GetxService {
       }
     }
 
-    // 2. Detect file type from the CDN URL
+    // Route to platform-specific downloader
+    if (item.platform == MediaPlatform.youtube) {
+      yield* _downloadYouTubeFile(item, downloadUrl);
+    } else {
+      yield* _downloadDirectFile(item, quality, downloadUrl);
+    }
+  }
+
+  // ─── Direct HTTP Download (TikTok / Instagram) ───────────────────────────
+
+  Stream<double> _downloadDirectFile(
+    DownloadItem item,
+    String quality,
+    String downloadUrl,
+  ) async* {
+    // Detect file type — first check URL extension, then content-type via HEAD
     final String urlLower = downloadUrl.toLowerCase();
     bool reallyIsVideo = item.type == DownloadType.video || item.type == DownloadType.carousel;
+
     if (urlLower.contains('.mp4') || urlLower.contains('.m4v') || urlLower.contains('.mov')) {
       reallyIsVideo = true;
-    } else if (urlLower.contains('.jpg') || urlLower.contains('.jpeg') || urlLower.contains('.png') || urlLower.contains('.webp')) {
+    } else if (urlLower.contains('.jpg') || urlLower.contains('.jpeg') ||
+        urlLower.contains('.png') || urlLower.contains('.webp')) {
       reallyIsVideo = false;
+    } else {
+      // No extension in URL — do a lightweight HEAD request to check Content-Type.
+      // This is the safeguard that prevents saving images as .mp4 (0-second videos).
+      try {
+        final headResp = await _dio.head(
+          downloadUrl,
+          options: Options(
+            followRedirects: true,
+            maxRedirects: 5,
+            receiveTimeout: const Duration(seconds: 10),
+            sendTimeout: const Duration(seconds: 10),
+          ),
+        );
+        final ct = headResp.headers.value('content-type') ?? '';
+        if (ct.contains('video')) {
+          reallyIsVideo = true;
+        } else if (ct.contains('image')) {
+          reallyIsVideo = false;
+        }
+        // If content-type is empty or ambiguous, keep the type from DownloadItem
+      } catch (_) {
+        // HEAD failed — trust the DownloadItem type
+      }
     }
 
     final String ext = reallyIsVideo ? 'mp4' : 'jpg';
     final String fileName = 'glowload_${item.id}_${quality.replaceAll(' ', '_')}.$ext';
 
-    // Stage file in app temp directory
-    final Directory tempDir = await getTemporaryDirectory();
-    final String tempPath = '${tempDir.path}/$fileName';
+    // Use documents directory (stable, unfragmented) for staging
+    final Directory stageDir = await _getStagingDirectory();
+    final String tempPath = '${stageDir.path}/$fileName';
 
     final StreamController<double> progressController = StreamController<double>();
 
@@ -397,13 +697,16 @@ class DownloadService extends GetxService {
       tempPath,
       deleteOnError: true,
       options: Options(
-        receiveTimeout: const Duration(minutes: 10),
+        receiveTimeout: const Duration(minutes: 15),
         followRedirects: true,
         maxRedirects: 5,
       ),
       onReceiveProgress: (received, total) {
         if (total > 0 && !progressController.isClosed) {
           progressController.add(received / total);
+        } else if (!progressController.isClosed) {
+          // Indeterminate — pulse at 0.5 so UI knows it's working
+          progressController.add(0.5);
         }
       },
     ).then((_) async {
@@ -414,7 +717,7 @@ class DownloadService extends GetxService {
         await Gal.putImage(tempPath, album: 'GlowLoad');
       }
 
-      // Clean up temp file
+      // Clean up staging file
       try {
         final f = File(tempPath);
         if (await f.exists()) await f.delete();
@@ -436,7 +739,87 @@ class DownloadService extends GetxService {
     yield* progressController.stream;
   }
 
+  // ─── YouTube Stream Download ─────────────────────────────────────────────
+
+  Stream<double> _downloadYouTubeFile(
+    DownloadItem item,
+    String streamUrl,
+  ) async* {
+    final StreamController<double> progressController = StreamController<double>();
+
+    _downloadYouTubeAsync(item, streamUrl, progressController);
+
+    yield* progressController.stream;
+  }
+
+  Future<void> _downloadYouTubeAsync(
+    DownloadItem item,
+    String streamUrl,
+    StreamController<double> progressController,
+  ) async {
+    try {
+      final String fileName = 'glowload_yt_${item.id}.mp4';
+      final Directory stageDir = await _getStagingDirectory();
+      final String stagePath = '${stageDir.path}/$fileName';
+      final File stageFile = File(stagePath);
+
+      // Download using Dio with progress
+      await _dio.download(
+        streamUrl,
+        stagePath,
+        deleteOnError: true,
+        options: Options(
+          receiveTimeout: const Duration(minutes: 30),
+          followRedirects: true,
+          maxRedirects: 5,
+        ),
+        onReceiveProgress: (received, total) {
+          if (total > 0 && !progressController.isClosed) {
+            progressController.add(received / total);
+          } else if (!progressController.isClosed) {
+            progressController.add(0.5);
+          }
+        },
+      );
+
+      // Save to gallery
+      await Gal.putVideo(stagePath, album: 'GlowLoad');
+
+      // Clean up
+      try {
+        if (await stageFile.exists()) await stageFile.delete();
+      } catch (_) {}
+
+      if (!progressController.isClosed) {
+        progressController.add(1.0);
+        await progressController.close();
+      }
+    } catch (e) {
+      if (!progressController.isClosed) {
+        progressController.addError(
+          Exception('YouTube download failed: ${e.toString().replaceAll('Exception:', '').trim()}'),
+        );
+        progressController.close();
+      }
+    }
+  }
+
   // ─── Helpers ──────────────────────────────────────────────────────────────
+
+  /// Returns a stable staging directory (not the fragmented temp cache).
+  Future<Directory> _getStagingDirectory() async {
+    Directory base;
+    if (Platform.isAndroid) {
+      base = (await getExternalStorageDirectory()) ?? await getApplicationDocumentsDirectory();
+    } else {
+      base = await getApplicationDocumentsDirectory();
+    }
+    final stagingDir = Directory('${base.path}/glowload_staging');
+    if (!await stagingDir.exists()) {
+      await stagingDir.create(recursive: true);
+    }
+    return stagingDir;
+  }
 
   String _cleanInstagramUrl(String url) {
     try {
@@ -446,6 +829,69 @@ class DownloadService extends GetxService {
     } catch (_) {
       return url;
     }
+  }
+
+  /// Extracts a bare YouTube video ID from any supported YouTube URL format:
+  ///   • https://www.youtube.com/watch?v=VIDEO_ID
+  ///   • https://youtu.be/VIDEO_ID
+  ///   • https://youtube.com/shorts/VIDEO_ID          ← Shorts
+  ///   • https://youtube.com/shorts/VIDEO_ID?si=...   ← Shorts with tracking
+  ///   • https://www.youtube.com/embed/VIDEO_ID
+  ///   • https://www.youtube.com/live/VIDEO_ID
+  ///
+  /// Returns an empty string if no valid ID could be found.
+  String _extractYouTubeVideoId(String url) {
+    try {
+      final uri = Uri.parse(url.trim());
+      final host = uri.host.toLowerCase();
+      final path = uri.path;
+
+      // ── youtu.be/VIDEO_ID ────────────────────────────────────────────────────
+      if (host == 'youtu.be' || host == 'www.youtu.be') {
+        final id = path.split('/').where((s) => s.isNotEmpty).firstOrNull ?? '';
+        return _sanitizeYtId(id);
+      }
+
+      // ── youtube.com paths ────────────────────────────────────────────────────
+      if (host.contains('youtube.com') || host.contains('yt.be')) {
+        // /shorts/VIDEO_ID
+        final shortsMatch = RegExp(r'/shorts/([A-Za-z0-9_-]+)').firstMatch(path);
+        if (shortsMatch != null) return _sanitizeYtId(shortsMatch.group(1) ?? '');
+
+        // /embed/VIDEO_ID
+        final embedMatch = RegExp(r'/embed/([A-Za-z0-9_-]+)').firstMatch(path);
+        if (embedMatch != null) return _sanitizeYtId(embedMatch.group(1) ?? '');
+
+        // /live/VIDEO_ID
+        final liveMatch = RegExp(r'/live/([A-Za-z0-9_-]+)').firstMatch(path);
+        if (liveMatch != null) return _sanitizeYtId(liveMatch.group(1) ?? '');
+
+        // ?v=VIDEO_ID  (regular watch URL)
+        final v = uri.queryParameters['v'] ?? '';
+        if (v.isNotEmpty) return _sanitizeYtId(v);
+
+        // /v/VIDEO_ID  (legacy)
+        final vPathMatch = RegExp(r'/v/([A-Za-z0-9_-]+)').firstMatch(path);
+        if (vPathMatch != null) return _sanitizeYtId(vPathMatch.group(1) ?? '');
+      }
+
+      // ── Bare 11-character ID passed directly ─────────────────────────────────
+      final bareId = RegExp(r'^[A-Za-z0-9_-]{11}$').firstMatch(url.trim());
+      if (bareId != null) return url.trim();
+
+    } catch (_) {}
+
+    return '';
+  }
+
+  /// Strips any extra characters (query params, fragments) that may have
+  /// been accidentally included in the extracted segment, and validates length.
+  String _sanitizeYtId(String raw) {
+    // Remove anything after ? or # or &
+    final clean = raw.split(RegExp(r'[?&#]')).first.trim();
+    // YouTube IDs are always 11 characters of [A-Za-z0-9_-]
+    if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(clean)) return clean;
+    return '';
   }
 
   String _mapDioError(DioException e, String platform) {

@@ -51,13 +51,20 @@ class HomeViewModel extends GetxController {
   /// Clears the input field
   void clearInput() {
     urlController.clear();
+    errorMessage.value = null;
   }
 
-  /// Pastes text from clipboard
+  /// Pastes text from clipboard, replacing any existing text.
   Future<void> pasteFromClipboard() async {
     final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
     if (clipboardData != null && clipboardData.text != null) {
-      urlController.text = clipboardData.text!;
+      // Replace whatever is in the field with the clipboard content
+      urlController.text = clipboardData.text!.trim();
+      // Move cursor to end
+      urlController.selection = TextSelection.fromPosition(
+        TextPosition(offset: urlController.text.length),
+      );
+      errorMessage.value = null;
     } else {
       Get.snackbar(
         'Clipboard Empty',
@@ -74,12 +81,12 @@ class HomeViewModel extends GetxController {
     final url = urlController.text.trim();
 
     if (url.isEmpty) {
-      errorMessage.value = 'Please enter or paste a TikTok or Instagram URL';
+      errorMessage.value = 'Please enter or paste a TikTok, Instagram, or YouTube URL';
       return;
     }
 
     if (!downloadService.isValidUrl(url)) {
-      errorMessage.value = 'Please enter a valid TikTok or Instagram URL';
+      errorMessage.value = 'Please enter a valid TikTok, Instagram, or YouTube URL';
       return;
     }
 
@@ -185,7 +192,9 @@ class HomeViewModel extends GetxController {
 
       Future.delayed(const Duration(milliseconds: 800), () {
         currentDownload.value = null;
-        Get.offAllNamed('/');
+        // Pop back to '/' without destroying the binding — avoids controller
+        // disposal race that causes "TextEditingController used after dispose"
+        Get.until((route) => route.settings.name == '/');
 
         Get.snackbar(
           '✅ Download Complete',

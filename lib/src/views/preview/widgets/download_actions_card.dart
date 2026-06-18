@@ -15,74 +15,175 @@ class DownloadActionsCard extends GetView<HomeViewModel> {
       if (item == null) return const SizedBox.shrink();
 
       final qualityOptions = item.qualityOptions;
+      final bool isYouTube = item.platform == MediaPlatform.youtube;
+      final bool isTikTok = item.platform == MediaPlatform.tiktok;
 
-      // Always show static buttons, but grey out ones not available
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // 1. Primary — No Watermark
+      // ── YouTube: show all available quality options as buttons ───────────────
+      if (isYouTube) {
+        return _buildYouTubeButtons(qualityOptions);
+      }
+
+      // ── TikTok ───────────────────────────────────────────────────────────────
+      if (isTikTok) {
+        return _buildTikTokButtons(qualityOptions);
+      }
+
+      // ── Instagram ─────────────────────────────────────────────────────────────
+      return _buildInstagramButtons(item, qualityOptions);
+    });
+  }
+
+  Widget _buildYouTubeButtons(Map<String, String> qualityOptions) {
+    // Quality priority order for display
+    const List<String> qualityPriority = [
+      '4K (2160p)',
+      'QHD (1440p)',
+      'Full HD (1080p)',
+      'HD (720p)',
+      'SD (480p)',
+      'Low (360p)',
+      'Lowest (240p)',
+    ];
+
+    final availableQualities = qualityPriority.where((q) => qualityOptions.containsKey(q)).toList();
+
+    // Add any keys not in the priority list
+    for (final key in qualityOptions.keys) {
+      if (!qualityPriority.contains(key)) {
+        availableQualities.add(key);
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Section label
+        Padding(
+          padding: const EdgeInsets.only(bottom: 14),
+          child: Text(
+            'SELECT QUALITY',
+            style: GoogleFonts.spaceGrotesk(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 2.0,
+              color: AppColors.textSecondary.withValues(alpha: 0.5),
+            ),
+          ),
+        ),
+        ...availableQualities.asMap().entries.map((entry) {
+          final index = entry.key;
+          final quality = entry.value;
+          final bool isTop = index == 0;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: _DownloadButton(
+              label: isTop ? '$quality  ★ Best' : quality,
+              icon: _ytQualityIcon(quality),
+              style: isTop ? _ButtonStyle.primary : _ButtonStyle.outlined,
+              isAvailable: true,
+              onTap: () => controller.startBackgroundDownload(quality),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+
+  Widget _buildTikTokButtons(Map<String, String> qualityOptions) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // HD (No Watermark) — highest quality TikTok
+        if (qualityOptions.containsKey('HD (No Watermark)')) ...[
           _DownloadButton(
-            label: 'Download Without Watermark',
-            icon: Icons.check_circle_outline_rounded,
+            label: 'Download HD · No Watermark',
+            icon: Icons.hd_rounded,
             style: _ButtonStyle.primary,
-            isAvailable: qualityOptions.containsKey('No Watermark'),
+            isAvailable: true,
+            onTap: () => controller.startBackgroundDownload('HD (No Watermark)'),
+          ),
+          const SizedBox(height: 16),
+        ],
+
+        // No Watermark fallback (SD version when HD differs)
+        if (qualityOptions.containsKey('No Watermark')) ...[
+          _DownloadButton(
+            label: 'Download · No Watermark',
+            icon: Icons.check_circle_outline_rounded,
+            style: qualityOptions.containsKey('HD (No Watermark)')
+                ? _ButtonStyle.outlined
+                : _ButtonStyle.primary,
+            isAvailable: true,
             onTap: () => controller.startBackgroundDownload('No Watermark'),
           ),
           const SizedBox(height: 16),
-
-          // 2. HD (TikTok only, may not always differ from No Watermark)
-          if (qualityOptions.containsKey('HD')) ...[
-            _DownloadButton(
-              label: 'Download HD',
-              icon: Icons.hd_rounded,
-              style: _ButtonStyle.outlined,
-              isAvailable: true,
-              onTap: () => controller.startBackgroundDownload('HD'),
-            ),
-            const SizedBox(height: 16),
-          ],
-
-          // 3. Instagram Direct (generic single download)
-          if (qualityOptions.containsKey('Download') && !qualityOptions.containsKey('No Watermark')) ...[
-            _DownloadButton(
-              label: 'Download',
-              icon: Icons.download_rounded,
-              style: _ButtonStyle.primary,
-              isAvailable: true,
-              onTap: () => controller.startBackgroundDownload('Download'),
-            ),
-            const SizedBox(height: 16),
-          ],
-
-          // 4. Carousel items (Instagram carousel posts)
-          if (item.type == DownloadType.carousel) ...[
-            ...qualityOptions.entries.where((e) => e.key.startsWith('Item ')).map((entry) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: _DownloadButton(
-                  label: 'Download ${entry.key}',
-                  icon: Icons.photo_library_rounded,
-                  style: _ButtonStyle.outlined,
-                  isAvailable: true,
-                  onTap: () => controller.startBackgroundDownload(entry.key),
-                ),
-              );
-            }),
-          ],
-
-          // 5. Watermarked (TikTok only)
-          if (qualityOptions.containsKey('Watermarked')) ...[
-            _DownloadButton(
-              label: 'Download with Watermark',
-              icon: Icons.branding_watermark_rounded,
-              style: _ButtonStyle.subtle,
-              isAvailable: true,
-              onTap: () => controller.startBackgroundDownload('Watermarked'),
-            ),
-          ],
         ],
-      );
-    });
+
+        // Watermarked
+        if (qualityOptions.containsKey('Watermarked')) ...[
+          _DownloadButton(
+            label: 'Download with Watermark',
+            icon: Icons.branding_watermark_rounded,
+            style: _ButtonStyle.subtle,
+            isAvailable: true,
+            onTap: () => controller.startBackgroundDownload('Watermarked'),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildInstagramButtons(DownloadItem item, Map<String, String> qualityOptions) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Primary — No Watermark
+        _DownloadButton(
+          label: 'Download Without Watermark',
+          icon: Icons.check_circle_outline_rounded,
+          style: _ButtonStyle.primary,
+          isAvailable: qualityOptions.containsKey('No Watermark'),
+          onTap: () => controller.startBackgroundDownload('No Watermark'),
+        ),
+        const SizedBox(height: 16),
+
+        // Instagram Direct (generic single download)
+        if (qualityOptions.containsKey('Download') && !qualityOptions.containsKey('No Watermark')) ...[
+          _DownloadButton(
+            label: 'Download',
+            icon: Icons.download_rounded,
+            style: _ButtonStyle.primary,
+            isAvailable: true,
+            onTap: () => controller.startBackgroundDownload('Download'),
+          ),
+          const SizedBox(height: 16),
+        ],
+
+        // Carousel items (Instagram carousel posts)
+        if (item.type == DownloadType.carousel) ...[
+          ...qualityOptions.entries.where((e) => e.key.startsWith('Item ')).map((entry) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _DownloadButton(
+                label: 'Download ${entry.key}',
+                icon: Icons.photo_library_rounded,
+                style: _ButtonStyle.outlined,
+                isAvailable: true,
+                onTap: () => controller.startBackgroundDownload(entry.key),
+              ),
+            );
+          }),
+        ],
+      ],
+    );
+  }
+
+  IconData _ytQualityIcon(String quality) {
+    if (quality.contains('4K') || quality.contains('2160')) return Icons.four_k_rounded;
+    if (quality.contains('1440')) return Icons.high_quality_rounded;
+    if (quality.contains('1080')) return Icons.hd_rounded;
+    if (quality.contains('720')) return Icons.hd_rounded;
+    return Icons.sd_rounded;
   }
 }
 

@@ -15,6 +15,7 @@ enum DownloadType {
 enum MediaPlatform {
   tiktok,
   instagram,
+  youtube,
   unknown,
 }
 
@@ -34,8 +35,11 @@ class DownloadItem {
   final String authorName;
   final MediaPlatform platform;
 
-  /// Map of quality-label → CDN download URL
-  /// e.g. { 'No Watermark': 'https://...', 'HD': 'https://...', 'Watermarked': 'https://...' }
+  /// Duration in seconds from the API (used before video player buffers)
+  final int durationSeconds;
+
+  /// Map of quality-label → CDN download URL or YouTube stream itag
+  /// e.g. { 'No Watermark': 'https://...', 'HD': 'https://...', 'Full HD (1080p)': 'itag:137' }
   final Map<String, String> qualityOptions;
 
   DownloadItem({
@@ -52,6 +56,7 @@ class DownloadItem {
     this.authorName = '',
     this.platform = MediaPlatform.unknown,
     this.qualityOptions = const {},
+    this.durationSeconds = 0,
   });
 
   DownloadItem copyWith({
@@ -68,6 +73,7 @@ class DownloadItem {
     String? authorName,
     MediaPlatform? platform,
     Map<String, String>? qualityOptions,
+    int? durationSeconds,
   }) {
     return DownloadItem(
       id: id ?? this.id,
@@ -83,6 +89,7 @@ class DownloadItem {
       authorName: authorName ?? this.authorName,
       platform: platform ?? this.platform,
       qualityOptions: qualityOptions ?? this.qualityOptions,
+      durationSeconds: durationSeconds ?? this.durationSeconds,
     );
   }
 

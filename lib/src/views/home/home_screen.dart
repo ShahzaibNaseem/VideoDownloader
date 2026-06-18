@@ -223,6 +223,11 @@ class HomeScreen extends GetView<HomeViewModel> {
                                   color: AppColors.secondary,
                                 ),
                                 _buildPlatformChip(
+                                  icon: Icons.smart_display_rounded,
+                                  label: 'YouTube',
+                                  color: const Color(0xFFFF4444),
+                                ),
+                                _buildPlatformChip(
                                   icon: Icons.movie,
                                   label: 'Reels',
                                   color: AppColors.tertiary,
@@ -349,7 +354,7 @@ class HomeScreen extends GetView<HomeViewModel> {
                               ),
                               const SizedBox(height: 6),
                               Text(
-                                'Your saved Instagram media will appear here.',
+                                'Your saved Instagram, TikTok & YouTube media will appear here.',
                                 textAlign: TextAlign.center,
                                 style: GoogleFonts.inter(
                                   color: AppColors.textMuted,

@@ -21,6 +21,8 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
   bool _isPlaying = false;
   bool _hasError = false;
   double _progress = 0.0;
+  Duration _currentPosition = Duration.zero;
+  Duration _totalDuration = Duration.zero;
   String? _initializedUrl;
 
   @override
@@ -33,10 +35,28 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
     final item = controller.activePreviewItem.value;
     if (item == null || item.type != DownloadType.video) return;
 
-    final String videoUrl = item.qualityOptions['No Watermark'] ??
+    // For YouTube, skip inline preview (stream URLs need auth headers that
+    // video_player can't set). Show thumbnail + duration badge instead.
+    if (item.platform == MediaPlatform.youtube) {
+      if (mounted) {
+        setState(() {
+          _hasError = false;
+          _isInitialized = false;
+          // Pre-populate duration from metadata
+          _totalDuration = Duration(seconds: item.durationSeconds);
+        });
+      }
+      return;
+    }
+
+    // Pick the highest-quality URL available for preview
+    final String videoUrl = item.qualityOptions['HD (No Watermark)'] ??
+        item.qualityOptions['No Watermark'] ??
         item.qualityOptions['Download'] ??
         item.qualityOptions['HD'] ??
-        item.qualityOptions.values.firstWhere((v) => v.isNotEmpty && v.startsWith('http'), orElse: () => '');
+        item.qualityOptions.values.firstWhere(
+            (v) => v.isNotEmpty && v.startsWith('http'),
+            orElse: () => '');
 
     if (videoUrl.isEmpty) {
       setState(() {
@@ -48,17 +68,26 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
     _initializedUrl = videoUrl;
     _videoController = VideoPlayerController.networkUrl(Uri.parse(videoUrl));
 
+    // Pre-populate duration from API metadata so it shows immediately
+    if (item.durationSeconds > 0) {
+      setState(() {
+        _totalDuration = Duration(seconds: item.durationSeconds);
+      });
+    }
+
     try {
       await _videoController!.initialize();
       await _videoController!.setLooping(true);
       await _videoController!.play();
-      
+
       _videoController!.addListener(_videoListener);
-      
+
       if (mounted) {
         setState(() {
           _isInitialized = true;
           _isPlaying = true;
+          // Use player duration (accurate) once initialized
+          _totalDuration = _videoController!.value.duration;
         });
       }
     } catch (e) {
@@ -75,9 +104,12 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
     if (_videoController == null) return;
     if (mounted) {
       setState(() {
-        _progress = _videoController!.value.duration.inMilliseconds > 0
-            ? _videoController!.value.position.inMilliseconds /
-                _videoController!.value.duration.inMilliseconds
+        final dur = _videoController!.value.duration;
+        final pos = _videoController!.value.position;
+        _totalDuration = dur.inMilliseconds > 0 ? dur : _totalDuration;
+        _currentPosition = pos;
+        _progress = _totalDuration.inMilliseconds > 0
+            ? pos.inMilliseconds / _totalDuration.inMilliseconds
             : 0.0;
       });
     }
@@ -103,6 +135,17 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
     });
   }
 
+  String _formatDuration(Duration d) {
+    if (d.inSeconds <= 0) return '0:00';
+    final hours = d.inHours;
+    final minutes = d.inMinutes.remainder(60);
+    final seconds = d.inSeconds.remainder(60);
+    if (hours > 0) {
+      return '$hours:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    }
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Obx(() {
@@ -114,15 +157,20 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
           'https://lh3.googleusercontent.com/aida-public/AB6AXuC_vaW9mCCtcnJk132bOcMuKItXeEFkz9bpe8MPzYlG04uMFoxW83120Kxji6VCy8B8zT58GRdSqSZ256LKhfNYF6A9y3NUmuSXHxnT2kb2jgr_BmH_2eDUG4uwu4B0bobWpViwLcx8sVffe7oEeTsUgIm6BI-XQ-9IZcdfl1kvDnVDkGbPdviLSzO_l9Zyy9vjCbLO2HLGCR8wKxxTzHRQfi0fYt6r9LsNrfkr80tppl7Ir1i7_d9vt080r8-kaWaQJLErHlkXlhU';
 
       final String imageUrl = item.thumbnailUrl.isNotEmpty ? item.thumbnailUrl : fallbackImage;
-      final bool isTikTok = item.url.contains('tiktok.com');
+      final bool isTikTok = item.platform == MediaPlatform.tiktok;
+      final bool isYouTube = item.platform == MediaPlatform.youtube;
 
-      // Re-initialize if the preview item changes
-      final String currentVideoUrl = item.qualityOptions['No Watermark'] ??
+      // Re-initialize if the preview item changes (and it's not YouTube)
+      final String currentVideoUrl = item.qualityOptions['HD (No Watermark)'] ??
+          item.qualityOptions['No Watermark'] ??
           item.qualityOptions['Download'] ??
           item.qualityOptions['HD'] ??
-          item.qualityOptions.values.firstWhere((v) => v.isNotEmpty && v.startsWith('http'), orElse: () => '');
-      
-      if (item.type == DownloadType.video && 
+          item.qualityOptions.values.firstWhere(
+              (v) => v.isNotEmpty && v.startsWith('http'),
+              orElse: () => '');
+
+      if (item.type == DownloadType.video &&
+          !isYouTube &&
           currentVideoUrl != _initializedUrl) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _videoController?.removeListener(_videoListener);
@@ -131,9 +179,34 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
           _isPlaying = false;
           _hasError = false;
           _progress = 0.0;
+          _currentPosition = Duration.zero;
+          _totalDuration = Duration(seconds: item.durationSeconds);
           _initializePlayer();
         });
       }
+
+      // Determine platform display info
+      String platformLabel;
+      IconData platformIcon;
+      Color platformColor;
+      if (isYouTube) {
+        platformLabel = 'YouTube';
+        platformIcon = Icons.smart_display_rounded;
+        platformColor = const Color(0xFFFF4444);
+      } else if (isTikTok) {
+        platformLabel = 'TikTok';
+        platformIcon = Icons.play_circle_outline;
+        platformColor = AppColors.primary;
+      } else {
+        platformLabel = 'Instagram';
+        platformIcon = Icons.camera_alt_outlined;
+        platformColor = AppColors.primary;
+      }
+
+      // Duration to display — prefer live player value once initialized
+      final Duration displayDuration = _totalDuration.inSeconds > 0
+          ? _totalDuration
+          : Duration(seconds: item.durationSeconds);
 
       return AspectRatio(
         aspectRatio: 9 / 16,
@@ -180,7 +253,7 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                 ),
               ),
 
-              // 2. Video Player Overlay
+              // 2. Video Player Overlay (only for non-YouTube)
               if (item.type == DownloadType.video && _isInitialized && _videoController != null)
                 Positioned.fill(
                   child: ClipRRect(
@@ -197,8 +270,8 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                   ),
                 ),
 
-              // 3. Play/Pause Tap Target Overlay
-              if (item.type == DownloadType.video)
+              // 3. Play/Pause Tap Target Overlay (not for YouTube — no inline preview)
+              if (item.type == DownloadType.video && !isYouTube)
                 Positioned.fill(
                   child: GestureDetector(
                     onTap: _togglePlayPause,
@@ -207,8 +280,43 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                   ),
                 ),
 
-              // 4. Play Icon Overlay in Center (only if not playing, or loading)
-              if (item.type == DownloadType.video && !_isPlaying && !_hasError)
+              // 4. YouTube icon overlay — signals "preview not available, download to watch"
+              if (isYouTube)
+                Center(
+                  child: IgnorePointer(
+                    child: ClipOval(
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 8.0, sigmaY: 8.0),
+                        child: Container(
+                          width: 80,
+                          height: 80,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0xFFFF4444).withValues(alpha: 0.25),
+                            border: Border.all(
+                                color: const Color(0xFFFF4444).withValues(alpha: 0.5), width: 1.5),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFFFF4444).withValues(alpha: 0.3),
+                                blurRadius: 30,
+                              ),
+                            ],
+                          ),
+                          child: const Center(
+                            child: Icon(
+                              Icons.smart_display_rounded,
+                              color: Colors.white,
+                              size: 44,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+              // 5. Play Icon Overlay in Center (only if not playing, or loading — non-YouTube)
+              if (item.type == DownloadType.video && !_isPlaying && !_hasError && !isYouTube)
                 Center(
                   child: IgnorePointer(
                     child: ClipOval(
@@ -241,8 +349,8 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                   ),
                 ),
 
-              // 5. Loading spinner during video player initialization
-              if (item.type == DownloadType.video && !_isInitialized && !_hasError)
+              // 6. Loading spinner during video player initialization (non-YouTube only)
+              if (item.type == DownloadType.video && !_isInitialized && !_hasError && !isYouTube)
                 Center(
                   child: IgnorePointer(
                     child: Container(
@@ -258,7 +366,7 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                   ),
                 ),
 
-              // 6. Platform Badge Overlay (Top Left)
+              // 7. Platform Badge Overlay (Top Left)
               Positioned(
                 top: 16,
                 left: 16,
@@ -277,13 +385,13 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            isTikTok ? Icons.play_circle_outline : Icons.camera_alt_outlined,
-                            color: AppColors.primary,
+                            platformIcon,
+                            color: platformColor,
                             size: 16,
                           ),
                           const SizedBox(width: 6),
                           Text(
-                            isTikTok ? 'TikTok' : 'Instagram',
+                            platformLabel,
                             style: GoogleFonts.inter(
                               color: Colors.white,
                               fontSize: 12,
@@ -297,7 +405,46 @@ class _VideoPreviewCardState extends State<VideoPreviewCard> {
                 ),
               ),
 
-              // 7. Video Progress Bar (Bottom)
+              // 8. Duration Badge (Bottom Right) — shown from API data immediately
+              if (item.type == DownloadType.video && displayDuration.inSeconds > 0)
+                Positioned(
+                  bottom: 16,
+                  right: 16,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 8.0, sigmaY: 8.0),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.7),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.white.withValues(alpha: 0.08), width: 1.0),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.videocam_rounded, color: Colors.white, size: 14),
+                            const SizedBox(width: 5),
+                            Text(
+                              _isInitialized
+                                  ? '${_formatDuration(_currentPosition)} / ${_formatDuration(displayDuration)}'
+                                  : _formatDuration(displayDuration),
+                              style: GoogleFonts.inter(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+              // 9. Seek progress bar (Bottom) — shown when video is playing
               if (item.type == DownloadType.video && _isInitialized && _videoController != null)
                 Positioned(
                   left: 0,

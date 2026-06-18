@@ -120,6 +120,8 @@ class CreatorInfoCard extends GetView<HomeViewModel> {
         return 'TikTok';
       case MediaPlatform.instagram:
         return 'Instagram';
+      case MediaPlatform.youtube:
+        return 'YouTube';
       case MediaPlatform.unknown:
         return 'Social Media';
     }
@@ -131,6 +133,8 @@ class CreatorInfoCard extends GetView<HomeViewModel> {
         return Icons.music_note_rounded;
       case MediaPlatform.instagram:
         return Icons.camera_alt_rounded;
+      case MediaPlatform.youtube:
+        return Icons.smart_display_rounded;
       case MediaPlatform.unknown:
         return Icons.public_rounded;
     }
